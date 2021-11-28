@@ -121,14 +121,16 @@ namespace {
       return FrameIndex; 
     }
     
-    void spill(MachineBasicBlock::iterator Before, Register VirtReg, MCPhysReg PhysReg, bool kill, bool end) {
+    void spill(MachineBasicBlock::iterator Before, Register VirtReg, MCPhysReg PhysReg, bool kill, bool eraseFromLive) {
       int FrameIndex;
       if (SpillMap.count(VirtReg) > 0) { 
         FrameIndex = SpillMap[VirtReg];
+        if (eraseFromLive) 
+          LiveVirtRegs.erase(VirtReg);
       } else {
         FrameIndex = allocateStackSlot(VirtReg);
         SpillMap[VirtReg] = FrameIndex;
-        if (!end) 
+        if (eraseFromLive) 
           LiveVirtRegs.erase(VirtReg); 
       }
       const TargetRegisterClass &RC = *MRI->getRegClass(VirtReg);
@@ -165,7 +167,7 @@ namespace {
           if (LiveVirtRegs.count(SpillVirtReg) > 0) {
             MachineBasicBlock::iterator SpillBefore = (MachineBasicBlock::iterator)MI.getIterator(); // FIXME why next? 
             bool kill = MO.isKill(); 
-            spill(SpillBefore, SpillVirtReg, SpillCandidate, kill, false); 
+            spill(SpillBefore, SpillVirtReg, SpillCandidate, kill, true); 
           }
           break; 
         }
@@ -228,6 +230,22 @@ namespace {
             markRegUsedInInstr(Reg);
             markRegUsedInBlk(Reg); 
           }  
+        } else if (MO.isRegMask()) { // for function call operand
+          MRI->addPhysRegsUsedFromRegMask(MO.getRegMask());
+          std::set<Register> SavedVirtRegs; 
+
+          const uint32_t *Mask = MO.getRegMask();
+          for (std::map<Register, MCPhysReg>::iterator it = LiveVirtRegs.begin(); it != LiveVirtRegs.end(); ++it) {
+            MCPhysReg PhysReg = it->second; 
+            if (MachineOperand::clobbersPhysReg(Mask, PhysReg)) {
+              SavedVirtRegs.insert(it->first); 
+              MachineBasicBlock::iterator SpillBefore = (MachineBasicBlock::iterator)MI.getIterator();
+              spill(SpillBefore, it->first, PhysReg, false, false);
+            }
+          }
+          for (Register R : SavedVirtRegs) {
+            LiveVirtRegs.erase(R); 
+          }
         }
       }
       // Allocate defs
@@ -266,7 +284,7 @@ namespace {
         dbgs() << it->first << "\n" << it->second << "\n";
         dbgs() << "after\n";
         if (it->first.isVirtual()) 
-          spill(InsertBefore, it->first, it->second, false, true);
+          spill(InsertBefore, it->first, it->second, false, false);
       }
     }
 
