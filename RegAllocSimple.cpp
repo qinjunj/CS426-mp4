@@ -169,8 +169,12 @@ namespace {
           if (LiveVirtRegs.count(SpillVirtReg) > 0) {
             MachineBasicBlock::iterator SpillBefore = (MachineBasicBlock::iterator)MI.getIterator(); // FIXME why next? 
             bool kill = MO.isKill(); 
-            if (!kill) 
-              spill(SpillBefore, SpillVirtReg, SpillCandidate, kill, true); 
+            if ((ReloadedRegs.count(SpillVirtReg) > 0 && ReloadedRegs[SpillVirtReg] == true) || SpillMap.count(SpillVirtReg) == 0) { 
+              spill(SpillBefore, SpillVirtReg, SpillCandidate, kill, true);
+              LiveVirtRegs.erase(SpillVirtReg); 
+              if (ReloadedRegs.count(SpillVirtReg) > 0)
+                ReloadedRegs.erase(SpillVirtReg); 
+            }
           }
           break; 
         }
@@ -207,6 +211,8 @@ namespace {
           LiveVirtRegs.erase(VirtReg); 
           if (SpillMap.count(VirtReg) > 0)
             SpillMap.erase(VirtReg);
+          if (ReloadedRegs.count(VirtReg) > 0)
+            ReloadedRegs.erase(VirtReg); 
         }
         return;
       }
@@ -219,10 +225,18 @@ namespace {
         setPhysReg(MI, MO, VirtReg, P); 
         markRegUsedInInstr(P);
         markRegUsedInBlk(P);
-        // clean when first reloaded
-        ReloadedRegs[VirtReg] = false;  
-        if (!MO.isKill()) { LiveVirtRegs[VirtReg] = P; LivePhysRegs[P] = VirtReg; dbgs() << VirtReg << "live virt \n"; } 
-        else { SpillMap.erase(VirtReg); ReloadedRegs.erase(VirtReg); } // FIXME should I also free the physreg in UsedInBlk? Should I erase it from ReloadedRegs?   
+          
+        if (!MO.isKill()) { 
+          LiveVirtRegs[VirtReg] = P; 
+          LivePhysRegs[P] = VirtReg; 
+          // clean when first reloaded
+          ReloadedRegs[VirtReg] = false;
+          dbgs() << VirtReg << "live virt \n"; 
+        } 
+        else { 
+          SpillMap.erase(VirtReg); 
+          ReloadedRegs.erase(VirtReg); 
+        } // FIXME should I also free the physreg in UsedInBlk? Should I erase it from ReloadedRegs?   
         return;
       }
       // VirtReg never met before
@@ -241,10 +255,12 @@ namespace {
 
     void allocateInstruction(MachineInstr &MI) {
       dbgs() << "Instr: " << "\n"; 
+       
       // find and allocate all virtual registers in MI
       UsedInInstr.clear(); 
       // Allocate uses first
       for (MachineOperand &MO : MI.operands()) {
+        dbgs() << SpillMap.size() << "\n";
         if (MO.isReg()) {
           Register Reg = MO.getReg();
           if (Reg.isVirtual() && MO.isUse()) {
@@ -257,6 +273,7 @@ namespace {
             markRegUsedInBlk(Reg); 
           }  
         } else if (MO.isRegMask()) { // for function call operand
+          dbgs() << "before function call: " << SpillMap.size() << "\n"; 
           MRI->addPhysRegsUsedFromRegMask(MO.getRegMask());
           std::set<Register> SavedVirtRegs; 
 
@@ -266,21 +283,25 @@ namespace {
             if (MachineOperand::clobbersPhysReg(Mask, PhysReg)) {
                
               MachineBasicBlock::iterator SpillBefore = (MachineBasicBlock::iterator)MI.getIterator();
-              // only spill dirty reloaded registers 
-              //if ((ReloadedRegs.count(it->first) > 0 && ReloadedRegs[it->first] == true) || SpillMap.count(it->first) == 0) { 
+              // only spill dirty reloaded registers FIXME
+              // if ((ReloadedRegs.count(it->first) > 0 && ReloadedRegs[it->first] == true) || SpillMap.count(it->first) == 0) { 
                 SavedVirtRegs.insert(it->first);
                 spill(SpillBefore, it->first, PhysReg, false, false);
-              //}
+              // }
             }
           }
           for (Register R : SavedVirtRegs) {
-            LiveVirtRegs.erase(R); 
+            LiveVirtRegs.erase(R);
+            if (ReloadedRegs.count(R) > 0) 
+              ReloadedRegs.erase(R); 
           }
+          dbgs() << "after a function call\n"; 
         }
       }
       // Allocate defs
-      for (MachineOperand &MO : MI.operands()) { 
-        if (MO.isReg()) {
+      for (MachineOperand &MO : MI.operands()) {
+         dbgs() << SpillMap.size() << "\n";
+         if (MO.isReg()) {
           Register Reg = MO.getReg();
           if (Reg.isVirtual() && MO.isDef()) {
             dbgs() << "Defs: \n"; 
@@ -317,7 +338,7 @@ namespace {
         MachineBasicBlock::iterator InsertBefore = (MachineBasicBlock::iterator)MBB.getFirstTerminator();
         dbgs() << it->first << "\n" << it->second << "\n";
         dbgs() << "after\n";
-        // if ((ReloadedRegs.count(it->first) > 0 && ReloadedRegs[it->first] == true) || SpillMap.count(it->first) == 0)
+        if ((ReloadedRegs.count(it->first) > 0 && ReloadedRegs[it->first] == true) || SpillMap.count(it->first) == 0)
           spill(InsertBefore, it->first, it->second, false, false);
       }
     }
