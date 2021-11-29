@@ -175,13 +175,41 @@ namespace {
       return PhysReg; 
     }
 
+    void setPhysReg(MachineInstr &MI, MachineOperand &MO, Register VirtReg, MCPhysReg PhysReg) {
+      MCPhysReg RealUsedPhysReg; 
+      unsigned SubRegIdx = MO.getSubReg();
+      if (SubRegIdx != 0) {
+       RealUsedPhysReg = TRI->getSubReg(PhysReg, SubRegIdx); 
+        // FIXME not sure the use of the following two lines
+        MO.setSubReg(0); 
+        // MO.setIsRenamable(true);
+        /*
+        if (MO.isKill()) {
+          MI.addRegisterKilled(PhysReg, TRI, true);
+          return;
+        }
+        if (MO.isDef() && MO.isUndef()) {
+          MI.addRegisterDead(PhysReg, TRI, true);
+        } else {
+          MI.addRegisterDefined(PhysReg, TRI); 
+        }
+        */
+      } else {
+        RealUsedPhysReg = PhysReg; 
+      }
+      MO.setReg(RealUsedPhysReg); 
+      // LiveVirtRegs[VirtReg] = RealUsedPhysReg;
+      // LivePhysRegs[RealUsedPhysReg] = VirtReg;
+    }
+
     /// Allocate physical register for virtual register operand
     void allocateOperand(MachineInstr &MI, MachineOperand &MO, Register VirtReg, bool is_use) {
       // allocate physical register for a virtual register
       // VirtReg already has corresponding PhysReg (only possible for uses)
       if (LiveVirtRegs.count(VirtReg) > 0) {
+        dbgs() << "in LiveVirtRegs\n"; 
         MCPhysReg PhysReg = LiveVirtRegs[VirtReg];
-        MO.setReg(PhysReg);
+        setPhysReg(MI, MO, VirtReg, PhysReg); 
         markRegUsedInInstr(PhysReg);
         markRegUsedInBlk(PhysReg);
         if (MO.isKill())  {
@@ -193,21 +221,26 @@ namespace {
       }
       // VirtReg was spilled before 
       if (SpillMap.count(VirtReg) > 0) {
+        dbgs() << "in SpillMap\n"; 
         MCPhysReg P = findPhysReg(MI, MO, VirtReg); 
         MachineBasicBlock::iterator LoadBefore = (MachineBasicBlock::iterator)MI.getIterator(); // FIXME where to insert?
         reload(LoadBefore, VirtReg, P);
-        MO.setReg(P);
+        setPhysReg(MI, MO, VirtReg, P); 
         markRegUsedInInstr(P);
         markRegUsedInBlk(P);
         if (!MO.isKill()) { LiveVirtRegs[VirtReg] = P; LivePhysRegs[P] = VirtReg; dbgs() << VirtReg << "live virt \n"; } 
-        else SpillMap.erase(VirtReg); 
+        else SpillMap.erase(VirtReg); // FIXME should I also free the physreg in UsedInBlk?  
         return;
       }
       // VirtReg never met before
+      dbgs() << "before findPhysReg\n";
       MCPhysReg PhysReg = findPhysReg(MI, MO, VirtReg);
-      MO.setReg(PhysReg); 
       markRegUsedInInstr(PhysReg);
       markRegUsedInBlk(PhysReg);
+      // Check for subregister
+      dbgs() << "before setPhysReg\n"; 
+      setPhysReg(MI, MO, VirtReg, PhysReg);
+      // where to put these two and use the super or sub register? 
       LiveVirtRegs[VirtReg] = PhysReg;
       LivePhysRegs[PhysReg] = VirtReg; 
       dbgs() << VirtReg << "live virt \n";
@@ -311,6 +344,7 @@ namespace {
         LivePhysRegs.clear(); 
         allocateBasicBlock(MBB);
       }
+      SpillMap.clear(); 
 
       MRI->clearVirtRegs();
 
