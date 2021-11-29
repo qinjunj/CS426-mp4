@@ -52,7 +52,9 @@ namespace {
     // inverse mapping of physical registers to virtual registers
     std::map<MCPhysReg, Register> LivePhysRegs; 
     std::set<MCPhysReg> UsedInInstr; 
-    std::set<MCPhysReg> UsedInBlk; 
+    std::set<MCPhysReg> UsedInBlk;
+    // keep track of dirtiness of reloaded registers 
+    std::map<Register, bool> ReloadedRegs;  
 
   public:
     StringRef getPassName() const override { return "Simple Register Allocator"; }
@@ -167,7 +169,8 @@ namespace {
           if (LiveVirtRegs.count(SpillVirtReg) > 0) {
             MachineBasicBlock::iterator SpillBefore = (MachineBasicBlock::iterator)MI.getIterator(); // FIXME why next? 
             bool kill = MO.isKill(); 
-            spill(SpillBefore, SpillVirtReg, SpillCandidate, kill, true); 
+            if (!kill) 
+              spill(SpillBefore, SpillVirtReg, SpillCandidate, kill, true); 
           }
           break; 
         }
@@ -182,18 +185,6 @@ namespace {
        RealUsedPhysReg = TRI->getSubReg(PhysReg, SubRegIdx); 
         // FIXME not sure the use of the following two lines
         MO.setSubReg(0); 
-        // MO.setIsRenamable(true);
-        /*
-        if (MO.isKill()) {
-          MI.addRegisterKilled(PhysReg, TRI, true);
-          return;
-        }
-        if (MO.isDef() && MO.isUndef()) {
-          MI.addRegisterDead(PhysReg, TRI, true);
-        } else {
-          MI.addRegisterDefined(PhysReg, TRI); 
-        }
-        */
       } else {
         RealUsedPhysReg = PhysReg; 
       }
@@ -228,8 +219,10 @@ namespace {
         setPhysReg(MI, MO, VirtReg, P); 
         markRegUsedInInstr(P);
         markRegUsedInBlk(P);
+        // clean when first reloaded
+        ReloadedRegs[VirtReg] = false;  
         if (!MO.isKill()) { LiveVirtRegs[VirtReg] = P; LivePhysRegs[P] = VirtReg; dbgs() << VirtReg << "live virt \n"; } 
-        else SpillMap.erase(VirtReg); // FIXME should I also free the physreg in UsedInBlk?  
+        else { SpillMap.erase(VirtReg); ReloadedRegs.erase(VirtReg); } // FIXME should I also free the physreg in UsedInBlk? Should I erase it from ReloadedRegs?   
         return;
       }
       // VirtReg never met before
@@ -258,7 +251,7 @@ namespace {
             dbgs() << "Uses: \n"; 
             dbgs() << MO.getReg() << " " << MO.getSubReg() << "\n";
             MO.dump(); 
-            allocateOperand(MI, MO, Reg, true); // FIXME getReg or getSubreg?  
+            allocateOperand(MI, MO, Reg, true);  
           } else if (Reg.isPhysical()) {
             markRegUsedInInstr(Reg);
             markRegUsedInBlk(Reg); 
@@ -271,9 +264,13 @@ namespace {
           for (std::map<Register, MCPhysReg>::iterator it = LiveVirtRegs.begin(); it != LiveVirtRegs.end(); ++it) {
             MCPhysReg PhysReg = it->second; 
             if (MachineOperand::clobbersPhysReg(Mask, PhysReg)) {
-              SavedVirtRegs.insert(it->first); 
+               
               MachineBasicBlock::iterator SpillBefore = (MachineBasicBlock::iterator)MI.getIterator();
-              spill(SpillBefore, it->first, PhysReg, false, false);
+              // only spill dirty reloaded registers 
+              //if ((ReloadedRegs.count(it->first) > 0 && ReloadedRegs[it->first] == true) || SpillMap.count(it->first) == 0) { 
+                SavedVirtRegs.insert(it->first);
+                spill(SpillBefore, it->first, PhysReg, false, false);
+              //}
             }
           }
           for (Register R : SavedVirtRegs) {
@@ -289,6 +286,7 @@ namespace {
             dbgs() << "Defs: \n"; 
             dbgs() << MO.getReg() << " " << MO.getSubReg() << "\n";
             MO.dump(); 
+            if (ReloadedRegs.count(Reg) > 0) ReloadedRegs[Reg] = true; 
             allocateOperand(MI, MO, Reg, false);  
           } else if (Reg.isPhysical()) {
             markRegUsedInInstr(Reg);
@@ -299,7 +297,8 @@ namespace {
     }
 
     void allocateBasicBlock(MachineBasicBlock &MBB) {
-      this->MBB = &MBB; 
+      this->MBB = &MBB;
+      MachineInstr *LastMI; 
       // allocate each instruction
       for (MachineInstr &MI : MBB) {
         // mark live-in registers as used
@@ -309,14 +308,16 @@ namespace {
           markRegUsedInBlk(Reg); 
         }
         allocateInstruction(MI);
+        LastMI = &MI; 
       }
       // spill all live registers at the end
-      dbgs() << LiveVirtRegs.size() << " map size\n"; 
+      dbgs() << LiveVirtRegs.size() << " map size\n";
+      if (LastMI->isReturn()) return; 
       for (std::map<Register, MCPhysReg>::iterator it = LiveVirtRegs.begin(); it != LiveVirtRegs.end(); ++it) {
         MachineBasicBlock::iterator InsertBefore = (MachineBasicBlock::iterator)MBB.getFirstTerminator();
         dbgs() << it->first << "\n" << it->second << "\n";
         dbgs() << "after\n";
-        if (it->first.isVirtual()) 
+        // if ((ReloadedRegs.count(it->first) > 0 && ReloadedRegs[it->first] == true) || SpillMap.count(it->first) == 0)
           spill(InsertBefore, it->first, it->second, false, false);
       }
     }
@@ -341,7 +342,8 @@ namespace {
         dbgs() << MBB.getName() << "\n";
         UsedInBlk.clear();
         LiveVirtRegs.clear();
-        LivePhysRegs.clear(); 
+        LivePhysRegs.clear();
+        ReloadedRegs.clear(); 
         allocateBasicBlock(MBB);
       }
       SpillMap.clear(); 
