@@ -39,20 +39,24 @@ namespace {
     const TargetRegisterInfo *TRI;
     const TargetInstrInfo *TII;
     RegisterClassInfo RegClassInfo;
-    
+   
+    // current basic block that being allocated 
     MachineBasicBlock *MBB; 
 
     // maintain information about live registers
 
-    // A live virtual register will be stored either in LiveVirtRegs or in SpillMap
     // record the mapping of virtual registers to stack slots
     std::map<Register, int> SpillMap;
     // record the mapping of virtual registers to physical registers
     std::map<Register, MCPhysReg> LiveVirtRegs; 
     // inverse mapping of physical registers to virtual registers
     std::map<MCPhysReg, Register> LivePhysRegs; 
-    std::set<MCPhysReg> UsedInInstr; 
-    std::set<MCPhysReg> UsedInBlk;
+    // keep track of RegUnit used
+    std::set<unsigned> UsedInInstr; 
+    std::set<unsigned> UsedInBlk;
+    // keep track fo physical registers used 
+    std::set<MCPhysReg> RegUsedInInstr;
+    std::set<MCPhysReg> RegUsedInBlk; 
     // keep track of dirtiness of reloaded registers 
     std::map<Register, bool> ReloadedRegs;  
 
@@ -103,28 +107,30 @@ namespace {
     }
 
     void markRegUsedInInstr(MCPhysReg PhysReg) {
-      for (MCRegUnitIterator Units(PhysReg, TRI); Units.isValid(); ++Units)
+      for (MCRegUnitIterator Units(PhysReg, TRI); Units.isValid(); ++Units) {
         UsedInInstr.insert(*Units);
+      }
     }
 
     void markRegUsedInBlk(MCPhysReg PhysReg) {
-      for (MCRegUnitIterator Units(PhysReg, TRI); Units.isValid(); ++Units)
+      for (MCRegUnitIterator Units(PhysReg, TRI); Units.isValid(); ++Units) {
         UsedInBlk.insert(*Units);
+      }
     }
 
     int allocateStackSlot(Register VirtReg) {
-      dbgs() << "before error\n";
       const TargetRegisterClass &RC = *MRI->getRegClass(VirtReg);
-      dbgs() << "after error\n"; 
       unsigned Size = TRI->getSpillSize(RC);
       Align Alignment = TRI->getSpillAlign(RC);
       int FrameIndex = MFI->CreateSpillStackObject(Size, Alignment); 
 
       return FrameIndex; 
     }
-    
+   
+    // spill to stack slot
     void spill(MachineBasicBlock::iterator Before, Register VirtReg, MCPhysReg PhysReg, bool kill, bool eraseFromLive) {
       int FrameIndex;
+      // spilled in the past
       if (SpillMap.count(VirtReg) > 0) { 
         FrameIndex = SpillMap[VirtReg];
         if (eraseFromLive) 
@@ -140,6 +146,7 @@ namespace {
       ++NumStores; 
     }
 
+    // reload from stack slot
     void reload(MachineBasicBlock::iterator Before, Register VirtReg, MCPhysReg PhysReg) {
       int FrameIndex = SpillMap[VirtReg];
       const TargetRegisterClass &RC = *MRI->getRegClass(VirtReg);
@@ -158,16 +165,17 @@ namespace {
         PhysReg = Candidate; 
         break; 
       }
+      
       // if not found
       if (!PhysReg) {
         // find a register curretly in use but not in UsedInInstr
-        for (MCPhysReg SpillCandidate : UsedInBlk) {
+        for (MCPhysReg SpillCandidate : AllocationOrder) {
           if (isRegUsedInInstr(SpillCandidate)) continue;
           PhysReg = SpillCandidate; 
           // Spill SpillCandidate
           Register SpillVirtReg = LivePhysRegs[PhysReg]; 
           if (LiveVirtRegs.count(SpillVirtReg) > 0) {
-            MachineBasicBlock::iterator SpillBefore = (MachineBasicBlock::iterator)MI.getIterator(); // FIXME why next? 
+            MachineBasicBlock::iterator SpillBefore = (MachineBasicBlock::iterator)MI.getIterator();  
             bool kill = MO.isKill(); 
             if ((ReloadedRegs.count(SpillVirtReg) > 0 && ReloadedRegs[SpillVirtReg] == true) || SpillMap.count(SpillVirtReg) == 0) { 
               spill(SpillBefore, SpillVirtReg, SpillCandidate, kill, true);
@@ -187,14 +195,11 @@ namespace {
       unsigned SubRegIdx = MO.getSubReg();
       if (SubRegIdx != 0) {
        RealUsedPhysReg = TRI->getSubReg(PhysReg, SubRegIdx); 
-        // FIXME not sure the use of the following two lines
         MO.setSubReg(0); 
       } else {
         RealUsedPhysReg = PhysReg; 
       }
       MO.setReg(RealUsedPhysReg); 
-      // LiveVirtRegs[VirtReg] = RealUsedPhysReg;
-      // LivePhysRegs[RealUsedPhysReg] = VirtReg;
     }
 
     /// Allocate physical register for virtual register operand
@@ -202,11 +207,12 @@ namespace {
       // allocate physical register for a virtual register
       // VirtReg already has corresponding PhysReg (only possible for uses)
       if (LiveVirtRegs.count(VirtReg) > 0) {
-        dbgs() << "in LiveVirtRegs\n"; 
         MCPhysReg PhysReg = LiveVirtRegs[VirtReg];
         setPhysReg(MI, MO, VirtReg, PhysReg); 
         markRegUsedInInstr(PhysReg);
+        RegUsedInInstr.insert(PhysReg);
         markRegUsedInBlk(PhysReg);
+        RegUsedInBlk.insert(PhysReg); 
         if (MO.isKill())  {
           LiveVirtRegs.erase(VirtReg); 
           if (SpillMap.count(VirtReg) > 0)
@@ -218,20 +224,19 @@ namespace {
       }
       // VirtReg was spilled before 
       if (SpillMap.count(VirtReg) > 0) {
-        dbgs() << "in SpillMap\n"; 
         MCPhysReg P = findPhysReg(MI, MO, VirtReg); 
-        MachineBasicBlock::iterator LoadBefore = (MachineBasicBlock::iterator)MI.getIterator(); // FIXME where to insert?
+        MachineBasicBlock::iterator LoadBefore = (MachineBasicBlock::iterator)MI.getIterator(); 
         reload(LoadBefore, VirtReg, P);
         setPhysReg(MI, MO, VirtReg, P); 
         markRegUsedInInstr(P);
+        RegUsedInInstr.insert(P);
         markRegUsedInBlk(P);
-          
+        RegUsedInBlk.insert(P);
         if (!MO.isKill()) { 
           LiveVirtRegs[VirtReg] = P; 
           LivePhysRegs[P] = VirtReg; 
           // clean when first reloaded
           ReloadedRegs[VirtReg] = false;
-          dbgs() << VirtReg << "live virt \n"; 
         } 
         else { 
           SpillMap.erase(VirtReg); 
@@ -240,40 +245,34 @@ namespace {
         return;
       }
       // VirtReg never met before
-      dbgs() << "before findPhysReg\n";
       MCPhysReg PhysReg = findPhysReg(MI, MO, VirtReg);
       markRegUsedInInstr(PhysReg);
+      RegUsedInInstr.insert(PhysReg);
       markRegUsedInBlk(PhysReg);
+      RegUsedInBlk.insert(PhysReg);
+      // dbgs() << PhysReg << " : RegUsedInBlk never met\n";
       // Check for subregister
-      dbgs() << "before setPhysReg\n"; 
       setPhysReg(MI, MO, VirtReg, PhysReg);
       // where to put these two and use the super or sub register? 
       LiveVirtRegs[VirtReg] = PhysReg;
       LivePhysRegs[PhysReg] = VirtReg; 
-      dbgs() << VirtReg << "live virt \n";
     }
 
     void allocateInstruction(MachineInstr &MI) {
-      dbgs() << "Instr: " << "\n"; 
        
       // find and allocate all virtual registers in MI
-      UsedInInstr.clear(); 
+      UsedInInstr.clear();
       // Allocate uses first
       for (MachineOperand &MO : MI.operands()) {
-        dbgs() << SpillMap.size() << "\n";
         if (MO.isReg()) {
           Register Reg = MO.getReg();
           if (Reg.isVirtual() && MO.isUse()) {
-            dbgs() << "Uses: \n"; 
-            dbgs() << MO.getReg() << " " << MO.getSubReg() << "\n";
-            MO.dump(); 
             allocateOperand(MI, MO, Reg, true);  
           } else if (Reg.isPhysical()) {
             markRegUsedInInstr(Reg);
-            markRegUsedInBlk(Reg); 
+            RegUsedInInstr.insert(Reg); 
           }  
         } else if (MO.isRegMask()) { // for function call operand
-          dbgs() << "before function call: " << SpillMap.size() << "\n"; 
           MRI->addPhysRegsUsedFromRegMask(MO.getRegMask());
           std::set<Register> SavedVirtRegs; 
 
@@ -295,23 +294,18 @@ namespace {
             if (ReloadedRegs.count(R) > 0) 
               ReloadedRegs.erase(R); 
           }
-          dbgs() << "after a function call\n"; 
         }
       }
       // Allocate defs
       for (MachineOperand &MO : MI.operands()) {
-         dbgs() << SpillMap.size() << "\n";
          if (MO.isReg()) {
           Register Reg = MO.getReg();
           if (Reg.isVirtual() && MO.isDef()) {
-            dbgs() << "Defs: \n"; 
-            dbgs() << MO.getReg() << " " << MO.getSubReg() << "\n";
-            MO.dump(); 
             if (ReloadedRegs.count(Reg) > 0) ReloadedRegs[Reg] = true; 
             allocateOperand(MI, MO, Reg, false);  
           } else if (Reg.isPhysical()) {
             markRegUsedInInstr(Reg);
-            markRegUsedInBlk(Reg); 
+            RegUsedInInstr.insert(Reg); 
           }
         } 
       }
@@ -319,25 +313,31 @@ namespace {
 
     void allocateBasicBlock(MachineBasicBlock &MBB) {
       this->MBB = &MBB;
-      MachineInstr *LastMI; 
-      // allocate each instruction
+      // mark all physical registers used in the block
       for (MachineInstr &MI : MBB) {
-        // mark live-in registers as used
+        for (MachineOperand &MO : MI.operands()) {
+          if (MO.isReg() && MO.getReg().isPhysical()) {
+            markRegUsedInBlk(MO.getReg());
+            RegUsedInBlk.insert(MO.getReg());  
+          }
+        }
+      }
+      // mark live-in registers as used
         for (MachineBasicBlock::RegisterMaskPair P : MBB.liveins()) {
           MCPhysReg Reg = P.PhysReg; 
-          dbgs() << Reg << "\n";
-          markRegUsedInBlk(Reg); 
+          markRegUsedInBlk(Reg);
+          RegUsedInBlk.insert(Reg); 
         }
+      MachineInstr *LastMI; 
+      // allocate each instruction
+      for (MachineInstr &MI : MBB) {  
         allocateInstruction(MI);
         LastMI = &MI; 
       }
       // spill all live registers at the end
-      dbgs() << LiveVirtRegs.size() << " map size\n";
       if (LastMI->isReturn()) return; 
       for (std::map<Register, MCPhysReg>::iterator it = LiveVirtRegs.begin(); it != LiveVirtRegs.end(); ++it) {
         MachineBasicBlock::iterator InsertBefore = (MachineBasicBlock::iterator)MBB.getFirstTerminator();
-        dbgs() << it->first << "\n" << it->second << "\n";
-        dbgs() << "after\n";
         if ((ReloadedRegs.count(it->first) > 0 && ReloadedRegs[it->first] == true) || SpillMap.count(it->first) == 0)
           spill(InsertBefore, it->first, it->second, false, false);
       }
@@ -360,7 +360,6 @@ namespace {
 
       // Allocate each basic block locally
       for (MachineBasicBlock &MBB : MF) {
-        dbgs() << MBB.getName() << "\n";
         UsedInBlk.clear();
         LiveVirtRegs.clear();
         LivePhysRegs.clear();
